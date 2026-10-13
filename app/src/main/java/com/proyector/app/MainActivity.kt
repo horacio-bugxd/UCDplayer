@@ -1,7 +1,6 @@
 package com.proyector.app
 
 import android.Manifest
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -17,22 +16,21 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
@@ -52,6 +50,7 @@ fun ProyectorTheme(content: @Composable () -> Unit) {
 @Composable
 fun App() {
     val ctx = LocalContext.current
+    val activity = ctx as ComponentActivity
 
     val perm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO
     else Manifest.permission.READ_EXTERNAL_STORAGE
@@ -66,6 +65,18 @@ fun App() {
         if (granted) videos = withContext(Dispatchers.IO) { loadVideos(ctx) }
     }
 
+    val pb = remember { Playback(ctx) }
+    DisposableEffect(Unit) {
+        val obs = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_STOP) pb.exo.pause()
+        }
+        activity.lifecycle.addObserver(obs)
+        onDispose {
+            activity.lifecycle.removeObserver(obs)
+            pb.release()
+        }
+    }
+
     var lists by remember { mutableStateOf(Store.load(ctx)) }
     fun update(newLists: List<Playlist>) {
         lists = newLists
@@ -75,31 +86,34 @@ fun App() {
     var tab by remember { mutableIntStateOf(0) }
     var folder by remember { mutableStateOf<String?>(null) }
     var openListId by remember { mutableStateOf<String?>(null) }
-    var play by remember { mutableStateOf<Pair<List<VideoItem>, Int>?>(null) }
     var picked by remember { mutableStateOf<Set<String>>(emptySet()) }
     var addDialog by remember { mutableStateOf(false) }
+    var fullscreen by remember { mutableStateOf(false) }
 
     val all = videos ?: emptyList()
     val f = folder
-    val cur = play
     val openList = lists.find { it.id == openListId }
 
     fun toItems(vs: List<MediaVideo>) = vs.map { VideoItem(it.uri, it.name) }
+    fun playQueue(vs: List<MediaVideo>, i: Int) {
+        pb.start(toItems(vs), i)
+        fullscreen = true
+    }
     fun toggle(uri: String) {
         picked = if (uri in picked) picked - uri else picked + uri
     }
-    fun pickedItems(): List<VideoItem> = toItems(all.filter { it.uri in picked })
     fun addTo(id: String) {
         val pl = lists.find { it.id == id } ?: return
         val existing = pl.items.map { it.uri }.toSet()
-        val add = pickedItems().filter { it.uri !in existing }
+        val add = toItems(all.filter { it.uri in picked }).filter { it.uri !in existing }
         update(lists.map { if (it.id == id) it.copy(items = it.items + add) else it })
         Toast.makeText(ctx, "Agregado a \"${pl.name}\"", Toast.LENGTH_SHORT).show()
         picked = emptySet()
         addDialog = false
     }
 
-    BackHandler(enabled = cur == null && (picked.isNotEmpty() || f != null || openListId != null)) {
+    val inPlayer = fullscreen && pb.active
+    BackHandler(enabled = !inPlayer && (picked.isNotEmpty() || f != null || openListId != null)) {
         when {
             picked.isNotEmpty() -> picked = emptySet()
             openListId != null -> openListId = null
@@ -107,86 +121,95 @@ fun App() {
         }
     }
 
-    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        if (cur != null) {
-            PlayerScreen(cur.first, cur.second) { play = null }
-        } else {
-            Row(Modifier.fillMaxSize().safeDrawingPadding()) {
-                val tabs = listOf(
-                    "Carpetas" to Icons.Default.Home,
-                    "Videos" to Icons.Default.PlayArrow,
-                    "Listas" to Icons.AutoMirrored.Filled.List
-                )
-                NavigationRail(
-                    containerColor = Color.Transparent,
-                    windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
-                ) {
-                    Spacer(Modifier.weight(1f))
-                    tabs.forEachIndexed { i, t ->
-                        NavigationRailItem(
-                            selected = tab == i,
-                            onClick = {
-                                tab = i
-                                folder = null
-                                openListId = null
-                                picked = emptySet()
-                            },
-                            icon = { Icon(t.second, contentDescription = null) },
-                            label = { Text(t.first) }
+    if (inPlayer) {
+        PlayerScreen(pb) { fullscreen = false }
+    } else {
+        Scaffold(
+            bottomBar = {
+                Column {
+                    if (pb.active) MiniPlayer(pb) { fullscreen = true }
+                    NavigationBar {
+                        val go = { i: Int ->
+                            tab = i
+                            folder = null
+                            openListId = null
+                            picked = emptySet()
+                        }
+                        NavigationBarItem(
+                            selected = tab == 0,
+                            onClick = { go(0) },
+                            icon = { Icon(Icons.Default.Home, contentDescription = null) },
+                            label = { Text("Inicio") }
+                        )
+                        NavigationBarItem(
+                            selected = tab == 1,
+                            onClick = { go(1) },
+                            icon = { GlyphIcon(Glyph.FOLDER, LocalContentColor.current) },
+                            label = { Text("Carpetas") }
+                        )
+                        NavigationBarItem(
+                            selected = tab == 2,
+                            onClick = { go(2) },
+                            icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) },
+                            label = { Text("Listas") }
                         )
                     }
-                    Spacer(Modifier.weight(1f))
                 }
-                Box(Modifier.weight(1f).fillMaxHeight()) {
-                    when {
-                        !granted -> PermissionScreen { launcher.launch(perm) }
-                        videos == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator()
+            }
+        ) { inner ->
+            Box(Modifier.padding(inner).fillMaxSize()) {
+                when {
+                    !granted -> PermissionScreen { launcher.launch(perm) }
+                    videos == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                    openList != null -> PlaylistDetail(
+                        p = openList,
+                        onBack = { openListId = null },
+                        onChange = { np -> update(lists.map { if (it.id == np.id) np else it }) },
+                        onDelete = {
+                            update(lists.filter { it.id != openList.id })
+                            openListId = null
+                        },
+                        onPlay = { i ->
+                            pb.start(openList.items, i)
+                            fullscreen = true
                         }
-                        openList != null -> PlaylistDetail(
-                            p = openList,
-                            onBack = { openListId = null },
-                            onChange = { np -> update(lists.map { if (it.id == np.id) np else it }) },
-                            onDelete = {
-                                update(lists.filter { it.id != openList.id })
-                                openListId = null
-                            },
-                            onPlay = { i -> play = openList.items to i }
-                        )
-                        tab == 0 && f != null -> {
-                            val vs = all.filter { it.folder == f }
-                            VideoListScreen(
-                                title = f,
-                                videos = vs,
-                                picked = picked,
-                                onBack = { folder = null },
-                                onPlay = { i -> play = toItems(vs) to i },
-                                onToggle = { toggle(it) },
-                                onAddPicked = { addDialog = true },
-                                onClear = { picked = emptySet() }
-                            )
-                        }
-                        tab == 0 -> FoldersScreen(all) { folder = it }
-                        tab == 1 -> VideoListScreen(
-                            title = "Videos",
-                            videos = all,
+                    )
+                    f != null -> {
+                        val vs = all.filter { it.folder == f }
+                        VideoListScreen(
+                            title = f,
+                            videos = vs,
                             picked = picked,
-                            onBack = null,
-                            onPlay = { i -> play = toItems(all) to i },
+                            onBack = { folder = null },
+                            onPlay = { i -> playQueue(vs, i) },
                             onToggle = { toggle(it) },
                             onAddPicked = { addDialog = true },
                             onClear = { picked = emptySet() }
                         )
-                        else -> ListsScreen(
-                            lists = lists,
-                            onOpen = { openListId = it },
-                            onCreate = { name ->
-                                val np = Playlist(newId(), name, emptyList())
-                                update(lists + np)
-                                openListId = np.id
-                            }
-                        )
                     }
+                    tab == 0 -> HomeScreen(
+                        videos = all,
+                        lists = lists,
+                        picked = picked,
+                        onOpenFolder = { folder = it; tab = 1 },
+                        onOpenList = { openListId = it; tab = 2 },
+                        onPlay = { vs, i -> playQueue(vs, i) },
+                        onToggle = { toggle(it) },
+                        onAddPicked = { addDialog = true },
+                        onClear = { picked = emptySet() }
+                    )
+                    tab == 1 -> FoldersScreen(all) { folder = it }
+                    else -> ListsScreen(
+                        lists = lists,
+                        onOpen = { openListId = it },
+                        onCreate = { name ->
+                            val np = Playlist(newId(), name, emptyList())
+                            update(lists + np)
+                            openListId = np.id
+                        }
+                    )
                 }
             }
         }

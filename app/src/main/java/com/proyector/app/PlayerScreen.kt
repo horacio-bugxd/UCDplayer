@@ -1,6 +1,6 @@
 package com.proyector.app
 
-import android.net.Uri
+import android.content.pm.ActivityInfo
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -8,15 +8,19 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -26,12 +30,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -39,18 +39,11 @@ import kotlinx.coroutines.delay
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
+fun PlayerScreen(pb: Playback, onExit: () -> Unit) {
     val ctx = LocalContext.current
     val activity = ctx as ComponentActivity
+    val exo = pb.exo
     BackHandler(onBack = onExit)
-
-    val exo = remember {
-        ExoPlayer.Builder(ctx).build().apply {
-            setMediaItems(items.map { MediaItem.fromUri(Uri.parse(it.uri)) }, start, 0L)
-            prepare()
-            playWhenReady = true
-        }
-    }
 
     val modes = remember {
         listOf(
@@ -60,46 +53,23 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
         )
     }
     var modeIdx by remember { mutableIntStateOf(0) }
-    var index by remember { mutableIntStateOf(start) }
-    var paused by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(false) }
-    var position by remember { mutableLongStateOf(0L) }
-    var duration by remember { mutableLongStateOf(0L) }
-    var dragging by remember { mutableStateOf(false) }
-    var dragValue by remember { mutableFloatStateOf(0f) }
+    var dragFrac by remember { mutableStateOf<Float?>(null) }
     var interaction by remember { mutableIntStateOf(0) }
+    val prog by rememberProgress(exo, showControls)
 
+    // Horizontal, pantalla completa y pantalla siempre encendida mientras se ve el video
     DisposableEffect(Unit) {
         val w = activity.window
         val c = WindowCompat.getInsetsController(w, w.decorView)
+        activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         c.hide(WindowInsetsCompat.Type.systemBars())
         w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
             c.show(WindowInsetsCompat.Type.systemBars())
             w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-    }
-
-    DisposableEffect(exo) {
-        val listener = object : Player.Listener {
-            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-                paused = !playWhenReady
-            }
-
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                index = exo.currentMediaItemIndex
-            }
-        }
-        exo.addListener(listener)
-        val obs = LifecycleEventObserver { _, e ->
-            if (e == Lifecycle.Event.ON_STOP) exo.pause()
-        }
-        activity.lifecycle.addObserver(obs)
-        onDispose {
-            activity.lifecycle.removeObserver(obs)
-            exo.removeListener(listener)
-            exo.release()
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }
     }
 
@@ -107,24 +77,31 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
     LaunchedEffect(showControls, interaction) {
         if (showControls) {
             delay(4000)
-            if (!dragging) showControls = false
+            if (dragFrac == null) showControls = false
         }
     }
 
-    // Actualiza posición y duración mientras los controles están visibles
-    LaunchedEffect(showControls) {
-        while (showControls) {
-            if (!dragging) position = exo.currentPosition
-            duration = exo.duration.coerceAtLeast(0L)
-            delay(250)
-        }
+    val seekable = prog.dur > 0 && prog.seekable
+    val notSeekable = exo.playbackState == Player.STATE_READY && !seekable
+
+    fun onSeekChange(f: Float) {
+        if (dragFrac == null) exo.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+        dragFrac = f
+        interaction++
+        exo.seekTo((f * prog.dur).toLong())
+    }
+
+    fun onSeekFinish() {
+        val f = dragFrac
+        exo.setSeekParameters(SeekParameters.EXACT)
+        if (f != null) exo.seekTo((f * prog.dur).toLong())
+        dragFrac = null
+        interaction++
     }
 
     fun seekBy(delta: Long) {
-        val d = exo.duration
         val t = exo.currentPosition + delta
-        exo.seekTo(if (d > 0) t.coerceIn(0L, d) else t.coerceAtLeast(0L))
-        position = exo.currentPosition
+        exo.seekTo(if (prog.dur > 0) t.coerceIn(0L, prog.dur) else t.coerceAtLeast(0L))
         interaction++
     }
 
@@ -137,7 +114,8 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
                     player = exo
                 }
             },
-            update = { it.resizeMode = modes[modeIdx].first }
+            update = { it.resizeMode = modes[modeIdx].first },
+            onRelease = { it.player = null }
         )
 
         // Gestos: 1 toque = controles, 2 toques = pausa, deslizar = cambiar de video
@@ -146,7 +124,7 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
                 .fillMaxSize()
                 .pointerInput(Unit) {
                     detectTapGestures(
-                        onDoubleTap = { exo.playWhenReady = !exo.playWhenReady },
+                        onDoubleTap = { pb.togglePlay() },
                         onTap = { showControls = !showControls }
                     )
                 }
@@ -156,13 +134,7 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
                         onDragStart = { total = 0f },
                         onHorizontalDrag = { _, d -> total += d },
                         onDragEnd = {
-                            if (total < -120f && exo.hasNextMediaItem()) {
-                                exo.seekToNextMediaItem()
-                                exo.playWhenReady = true
-                            } else if (total > 120f && exo.hasPreviousMediaItem()) {
-                                exo.seekToPreviousMediaItem()
-                                exo.playWhenReady = true
-                            }
+                            if (total < -120f) pb.next() else if (total > 120f) pb.previous()
                         }
                     )
                 }
@@ -175,27 +147,51 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
             modifier = Modifier.fillMaxSize()
         ) {
             val white = ButtonDefaults.textButtonColors(contentColor = Color.White)
+            val shownPos = dragFrac?.let { (it * prog.dur).toLong() } ?: prog.pos
+            val frac = dragFrac ?: if (prog.dur > 0) prog.pos.toFloat() / prog.dur else 0f
+            val cur = pb.items.getOrNull(pb.index)
+
             Box(Modifier.fillMaxSize()) {
+                Box(
+                    Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .height(110.dp)
+                        .background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.75f), Color.Transparent)))
+                )
+                Box(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(170.dp)
+                        .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.8f))))
+                )
+
                 Row(
                     Modifier
                         .align(Alignment.TopCenter)
                         .fillMaxWidth()
-                        .background(Color.Black.copy(alpha = 0.6f))
-                        .pointerInput(Unit) { detectTapGestures(onTap = { interaction++ }) }
                         .displayCutoutPadding()
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onExit) {
-                        Icon(Icons.Default.Close, contentDescription = "Salir", tint = Color.White)
+                        Icon(Icons.Default.Close, contentDescription = "Volver", tint = Color.White)
                     }
-                    Text(
-                        items.getOrNull(index)?.name ?: "",
-                        color = Color.White,
-                        modifier = Modifier.weight(1f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            cur?.name ?: "",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            "${pb.index + 1} / ${pb.items.size}",
+                            color = Color.White.copy(alpha = 0.7f),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
                     TextButton(
                         onClick = {
                             modeIdx = (modeIdx + 1) % modes.size
@@ -205,73 +201,62 @@ fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
                     ) { Text("Aspecto: ${modes[modeIdx].second}") }
                 }
 
+                Row(
+                    Modifier.align(Alignment.Center),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    TextButton(onClick = { seekBy(-10_000L) }, colors = white) { Text("−10 s") }
+                    IconButton(onClick = { pb.previous(); interaction++ }, modifier = Modifier.size(56.dp)) {
+                        GlyphIcon(Glyph.PREV, Color.White, 32.dp)
+                    }
+                    Box(
+                        Modifier
+                            .size(76.dp)
+                            .clip(RoundedCornerShape(28.dp))
+                            .background(MaterialTheme.colorScheme.primary)
+                            .clickable { pb.togglePlay(); interaction++ },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        GlyphIcon(
+                            if (pb.paused) Glyph.PLAY else Glyph.PAUSE,
+                            MaterialTheme.colorScheme.onPrimary,
+                            40.dp
+                        )
+                    }
+                    IconButton(onClick = { pb.next(); interaction++ }, modifier = Modifier.size(56.dp)) {
+                        GlyphIcon(Glyph.NEXT, Color.White, 32.dp)
+                    }
+                    TextButton(onClick = { seekBy(10_000L) }, colors = white) { Text("+10 s") }
+                }
+
                 Column(
                     Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .background(Color.Black.copy(alpha = 0.6f))
-                        .pointerInput(Unit) { detectTapGestures(onTap = { interaction++ }) }
                         .displayCutoutPadding()
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .padding(horizontal = 24.dp, vertical = 12.dp)
                 ) {
-                    val max = maxOf(duration, 1L).toFloat()
+                    if (notSeekable) {
+                        Text(
+                            "Este archivo no permite adelantar ni retroceder",
+                            color = Color.White.copy(alpha = 0.8f),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(fmtTime(if (dragging) dragValue.toLong() else position), color = Color.White)
-                        Slider(
-                            value = (if (dragging) dragValue else position.toFloat()).coerceIn(0f, max),
-                            onValueChange = {
-                                if (!dragging) exo.setSeekParameters(SeekParameters.CLOSEST_SYNC)
-                                dragging = true
-                                dragValue = it
-                                interaction++
-                                exo.seekTo(it.toLong())
-                            },
-                            onValueChangeFinished = {
-                                exo.setSeekParameters(SeekParameters.EXACT)
-                                exo.seekTo(dragValue.toLong())
-                                position = dragValue.toLong()
-                                dragging = false
-                                interaction++
-                            },
-                            valueRange = 0f..max,
+                        Text(fmtTime(shownPos), color = Color.White, style = MaterialTheme.typography.labelLarge)
+                        SeekBar(
+                            frac = frac,
+                            playing = !pb.paused,
+                            enabled = seekable,
+                            color = MaterialTheme.colorScheme.primary,
+                            trackColor = Color.White.copy(alpha = 0.3f),
+                            onChange = { onSeekChange(it) },
+                            onFinish = { onSeekFinish() },
                             modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
                         )
-                        Text(fmtTime(duration), color = Color.White)
-                    }
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        TextButton(
-                            onClick = {
-                                if (exo.hasPreviousMediaItem()) {
-                                    exo.seekToPreviousMediaItem()
-                                    exo.playWhenReady = true
-                                }
-                                interaction++
-                            },
-                            colors = white
-                        ) { Text("◀ Anterior") }
-                        TextButton(onClick = { seekBy(-10_000L) }, colors = white) { Text("−10 s") }
-                        TextButton(
-                            onClick = {
-                                exo.playWhenReady = !exo.playWhenReady
-                                interaction++
-                            },
-                            colors = white
-                        ) { Text(if (paused) "Reproducir" else "Pausar") }
-                        TextButton(onClick = { seekBy(10_000L) }, colors = white) { Text("+10 s") }
-                        TextButton(
-                            onClick = {
-                                if (exo.hasNextMediaItem()) {
-                                    exo.seekToNextMediaItem()
-                                    exo.playWhenReady = true
-                                }
-                                interaction++
-                            },
-                            colors = white
-                        ) { Text("Siguiente ▶") }
+                        Text(fmtTime(prog.dur), color = Color.White, style = MaterialTheme.typography.labelLarge)
                     }
                 }
             }
