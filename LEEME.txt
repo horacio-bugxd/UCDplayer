@@ -1,0 +1,4 @@
+Proyector - reproductor de videos locales con listas (Material You).
+1) Sube todo este contenido a un repositorio de GitHub.
+2) En GitHub: pestana Actions -> Build APK -> espera el check verde.
+3) Abre esa ejecucion y descarga "Proyector-APK" (abajo, en Artifacts). Descomprime e instala app-debug.apk.
