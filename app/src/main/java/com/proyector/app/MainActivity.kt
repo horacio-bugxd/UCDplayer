@@ -1,272 +1,208 @@
 package com.proyector.app
 
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
+import android.Manifest
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         setContent { ProyectorTheme { App() } }
     }
 }
 
 @Composable
 fun ProyectorTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
     val ctx = LocalContext.current
-    val scheme = when {
-        Build.VERSION.SDK_INT >= 31 ->
-            if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
-        dark -> darkColorScheme()
-        else -> lightColorScheme()
-    }
+    val base = if (Build.VERSION.SDK_INT >= 31) dynamicDarkColorScheme(ctx) else darkColorScheme()
+    val scheme = base.copy(background = Color(0xFF0E0E11), surface = Color(0xFF0E0E11))
     MaterialTheme(colorScheme = scheme, content = content)
 }
 
 @Composable
 fun App() {
     val ctx = LocalContext.current
-    var lists by remember { mutableStateOf(Store.load(ctx)) }
-    var openId by remember { mutableStateOf<String?>(null) }
-    var playingId by remember { mutableStateOf<String?>(null) }
 
+    val perm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO
+    else Manifest.permission.READ_EXTERNAL_STORAGE
+    var granted by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED)
+    }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+    LaunchedEffect(Unit) { if (!granted) launcher.launch(perm) }
+
+    var videos by remember { mutableStateOf<List<MediaVideo>?>(null) }
+    LaunchedEffect(granted) {
+        if (granted) videos = withContext(Dispatchers.IO) { loadVideos(ctx) }
+    }
+
+    var lists by remember { mutableStateOf(Store.load(ctx)) }
     fun update(newLists: List<Playlist>) {
         lists = newLists
         Store.save(ctx, newLists)
     }
 
-    val playing = lists.find { it.id == playingId }
-    val open = lists.find { it.id == openId }
+    var tab by remember { mutableIntStateOf(0) }
+    var folder by remember { mutableStateOf<String?>(null) }
+    var openListId by remember { mutableStateOf<String?>(null) }
+    var play by remember { mutableStateOf<Pair<List<VideoItem>, Int>?>(null) }
+    var picked by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var addDialog by remember { mutableStateOf(false) }
 
-    when {
-        playing != null -> PlayerScreen(playing.items) { playingId = null }
-        open != null -> PlaylistScreen(
-            p = open,
-            onBack = { openId = null },
-            onChange = { np -> update(lists.map { if (it.id == np.id) np else it }) },
-            onDelete = {
-                update(lists.filter { it.id != open.id })
-                openId = null
-            },
-            onPlay = { playingId = open.id }
-        )
-        else -> ListsScreen(
+    val all = videos ?: emptyList()
+    val f = folder
+    val cur = play
+    val openList = lists.find { it.id == openListId }
+
+    fun toItems(vs: List<MediaVideo>) = vs.map { VideoItem(it.uri, it.name) }
+    fun toggle(uri: String) {
+        picked = if (uri in picked) picked - uri else picked + uri
+    }
+    fun pickedItems(): List<VideoItem> = toItems(all.filter { it.uri in picked })
+    fun addTo(id: String) {
+        val pl = lists.find { it.id == id } ?: return
+        val existing = pl.items.map { it.uri }.toSet()
+        val add = pickedItems().filter { it.uri !in existing }
+        update(lists.map { if (it.id == id) it.copy(items = it.items + add) else it })
+        Toast.makeText(ctx, "Agregado a \"${pl.name}\"", Toast.LENGTH_SHORT).show()
+        picked = emptySet()
+        addDialog = false
+    }
+
+    BackHandler(enabled = cur == null && (picked.isNotEmpty() || f != null || openListId != null)) {
+        when {
+            picked.isNotEmpty() -> picked = emptySet()
+            openListId != null -> openListId = null
+            else -> folder = null
+        }
+    }
+
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        if (cur != null) {
+            PlayerScreen(cur.first, cur.second) { play = null }
+        } else {
+            Row(Modifier.fillMaxSize().safeDrawingPadding()) {
+                val tabs = listOf(
+                    "Carpetas" to Icons.Default.Home,
+                    "Videos" to Icons.Default.PlayArrow,
+                    "Listas" to Icons.AutoMirrored.Filled.List
+                )
+                NavigationRail(
+                    containerColor = Color.Transparent,
+                    windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
+                ) {
+                    Spacer(Modifier.weight(1f))
+                    tabs.forEachIndexed { i, t ->
+                        NavigationRailItem(
+                            selected = tab == i,
+                            onClick = {
+                                tab = i
+                                folder = null
+                                openListId = null
+                                picked = emptySet()
+                            },
+                            icon = { Icon(t.second, contentDescription = null) },
+                            label = { Text(t.first) }
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                }
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    when {
+                        !granted -> PermissionScreen { launcher.launch(perm) }
+                        videos == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                        openList != null -> PlaylistDetail(
+                            p = openList,
+                            onBack = { openListId = null },
+                            onChange = { np -> update(lists.map { if (it.id == np.id) np else it }) },
+                            onDelete = {
+                                update(lists.filter { it.id != openList.id })
+                                openListId = null
+                            },
+                            onPlay = { i -> play = openList.items to i }
+                        )
+                        tab == 0 && f != null -> {
+                            val vs = all.filter { it.folder == f }
+                            VideoListScreen(
+                                title = f,
+                                videos = vs,
+                                picked = picked,
+                                onBack = { folder = null },
+                                onPlay = { i -> play = toItems(vs) to i },
+                                onToggle = { toggle(it) },
+                                onAddPicked = { addDialog = true },
+                                onClear = { picked = emptySet() }
+                            )
+                        }
+                        tab == 0 -> FoldersScreen(all) { folder = it }
+                        tab == 1 -> VideoListScreen(
+                            title = "Videos",
+                            videos = all,
+                            picked = picked,
+                            onBack = null,
+                            onPlay = { i -> play = toItems(all) to i },
+                            onToggle = { toggle(it) },
+                            onAddPicked = { addDialog = true },
+                            onClear = { picked = emptySet() }
+                        )
+                        else -> ListsScreen(
+                            lists = lists,
+                            onOpen = { openListId = it },
+                            onCreate = { name ->
+                                val np = Playlist(newId(), name, emptyList())
+                                update(lists + np)
+                                openListId = np.id
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    if (addDialog) {
+        AddToListDialog(
             lists = lists,
-            onOpen = { openId = it },
-            onCreate = { name ->
+            count = picked.size,
+            onPick = { addTo(it) },
+            onNew = { name ->
                 val np = Playlist(newId(), name, emptyList())
                 update(lists + np)
-                openId = np.id
-            }
-        )
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun ListsScreen(lists: List<Playlist>, onOpen: (String) -> Unit, onCreate: (String) -> Unit) {
-    var showDialog by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf("") }
-
-    Scaffold(
-        topBar = { TopAppBar(title = { Text("Mis listas") }) },
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = { name = ""; showDialog = true },
-                icon = { Icon(Icons.Default.Add, contentDescription = null) },
-                text = { Text("Nueva lista") }
-            )
-        }
-    ) { inner ->
-        if (lists.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(inner), contentAlignment = Alignment.Center) {
-                Text("Aún no tienes listas.\nToca \"Nueva lista\" para empezar.")
-            }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(260.dp),
-                modifier = Modifier.padding(inner),
-                contentPadding = PaddingValues(16.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                items(lists, key = { it.id }) { p ->
-                    Card(onClick = { onOpen(p.id) }, modifier = Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(20.dp)) {
-                            Text(p.name, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Spacer(Modifier.height(4.dp))
-                            Text("${p.items.size} videos", style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (showDialog) {
-        AlertDialog(
-            onDismissRequest = { showDialog = false },
-            title = { Text("Nueva lista") },
-            text = {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("Nombre") },
-                    singleLine = true
-                )
+                addTo(np.id)
             },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        val n = name.trim()
-                        if (n.isNotEmpty()) {
-                            showDialog = false
-                            onCreate(n)
-                        }
-                    }
-                ) { Text("Crear") }
-            },
-            dismissButton = { TextButton(onClick = { showDialog = false }) { Text("Cancelar") } }
-        )
-    }
-}
-
-fun displayName(ctx: Context, uri: Uri): String {
-    ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-        if (c.moveToFirst()) {
-            val n = c.getString(0)
-            if (!n.isNullOrBlank()) return n.substringBeforeLast('.')
-        }
-    }
-    return "Video"
-}
-
-fun swap(list: List<VideoItem>, a: Int, b: Int): List<VideoItem> {
-    if (a !in list.indices || b !in list.indices) return list
-    val m = list.toMutableList()
-    val t = m[a]
-    m[a] = m[b]
-    m[b] = t
-    return m
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun PlaylistScreen(
-    p: Playlist,
-    onBack: () -> Unit,
-    onChange: (Playlist) -> Unit,
-    onDelete: () -> Unit,
-    onPlay: () -> Unit
-) {
-    val ctx = LocalContext.current
-    var confirmDelete by remember { mutableStateOf(false) }
-    BackHandler(onBack = onBack)
-
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        val added = uris.map { uri ->
-            try {
-                ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (_: Exception) {
-            }
-            VideoItem(uri.toString(), displayName(ctx, uri))
-        }
-        if (added.isNotEmpty()) onChange(p.copy(items = p.items + added))
-    }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Volver")
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { confirmDelete = true }) {
-                        Icon(Icons.Default.Delete, contentDescription = "Eliminar lista")
-                    }
-                }
-            )
-        }
-    ) { inner ->
-        Column(Modifier.padding(inner).padding(horizontal = 16.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(vertical = 8.dp)) {
-                Button(onClick = onPlay, enabled = p.items.isNotEmpty()) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Reproducir")
-                }
-                FilledTonalButton(onClick = { picker.launch(arrayOf("video/*")) }) {
-                    Icon(Icons.Default.Add, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Agregar videos")
-                }
-            }
-            if (p.items.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Esta lista está vacía.\nToca \"Agregar videos\".")
-                }
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-                    itemsIndexed(p.items) { i, v ->
-                        Card(Modifier.fillMaxWidth()) {
-                            Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Text("${i + 1}", style = MaterialTheme.typography.titleMedium)
-                                Spacer(Modifier.width(16.dp))
-                                Text(v.name, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                IconButton(onClick = { onChange(p.copy(items = swap(p.items, i, i - 1))) }, enabled = i > 0) { Text("▲") }
-                                IconButton(onClick = { onChange(p.copy(items = swap(p.items, i, i + 1))) }, enabled = i < p.items.lastIndex) { Text("▼") }
-                                IconButton(onClick = { onChange(p.copy(items = p.items.filterIndexed { k, _ -> k != i })) }) {
-                                    Icon(Icons.Default.Close, contentDescription = "Quitar")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("¿Eliminar \"${p.name}\"?") },
-            text = { Text("Los videos no se borran del teléfono, solo la lista.") },
-            confirmButton = { TextButton(onClick = { confirmDelete = false; onDelete() }) { Text("Eliminar") } },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancelar") } }
+            onDismiss = { addDialog = false }
         )
     }
 }

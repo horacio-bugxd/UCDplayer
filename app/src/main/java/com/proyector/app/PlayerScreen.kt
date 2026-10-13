@@ -32,25 +32,21 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
 
-private fun fmt(ms: Long): String {
-    val s = ms / 1000
-    return "%d:%02d".format(s / 60, s % 60)
-}
-
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
+fun PlayerScreen(items: List<VideoItem>, start: Int, onExit: () -> Unit) {
     val ctx = LocalContext.current
     val activity = ctx as ComponentActivity
     BackHandler(onBack = onExit)
 
     val exo = remember {
         ExoPlayer.Builder(ctx).build().apply {
-            setMediaItems(items.map { MediaItem.fromUri(Uri.parse(it.uri)) })
+            setMediaItems(items.map { MediaItem.fromUri(Uri.parse(it.uri)) }, start, 0L)
             prepare()
             playWhenReady = true
         }
@@ -64,13 +60,15 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
         )
     }
     var modeIdx by remember { mutableIntStateOf(0) }
-    var index by remember { mutableIntStateOf(0) }
+    var index by remember { mutableIntStateOf(start) }
     var paused by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(false) }
     var position by remember { mutableLongStateOf(0L) }
     var duration by remember { mutableLongStateOf(0L) }
+    var dragging by remember { mutableStateOf(false) }
+    var dragValue by remember { mutableFloatStateOf(0f) }
+    var interaction by remember { mutableIntStateOf(0) }
 
-    // Pantalla completa inmersiva y pantalla siempre encendida
     DisposableEffect(Unit) {
         val w = activity.window
         val c = WindowCompat.getInsetsController(w, w.decorView)
@@ -105,17 +103,29 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
         }
     }
 
-    LaunchedEffect(showControls) {
+    // Oculta los controles 4 s después de la última interacción
+    LaunchedEffect(showControls, interaction) {
         if (showControls) {
-            var t = 0
-            while (t < 4000) {
-                position = exo.currentPosition
-                duration = exo.duration.coerceAtLeast(0L)
-                delay(400)
-                t += 400
-            }
-            showControls = false
+            delay(4000)
+            if (!dragging) showControls = false
         }
+    }
+
+    // Actualiza posición y duración mientras los controles están visibles
+    LaunchedEffect(showControls) {
+        while (showControls) {
+            if (!dragging) position = exo.currentPosition
+            duration = exo.duration.coerceAtLeast(0L)
+            delay(250)
+        }
+    }
+
+    fun seekBy(delta: Long) {
+        val d = exo.duration
+        val t = exo.currentPosition + delta
+        exo.seekTo(if (d > 0) t.coerceIn(0L, d) else t.coerceAtLeast(0L))
+        position = exo.currentPosition
+        interaction++
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -130,7 +140,7 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
             update = { it.resizeMode = modes[modeIdx].first }
         )
 
-        // Capa de gestos: 1 toque = controles, 2 toques = pausa, deslizar = cambiar video
+        // Gestos: 1 toque = controles, 2 toques = pausa, deslizar = cambiar de video
         Box(
             Modifier
                 .fillMaxSize()
@@ -171,6 +181,7 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
                         .align(Alignment.TopCenter)
                         .fillMaxWidth()
                         .background(Color.Black.copy(alpha = 0.6f))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { interaction++ }) }
                         .displayCutoutPadding()
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -186,7 +197,10 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
                         overflow = TextOverflow.Ellipsis
                     )
                     TextButton(
-                        onClick = { modeIdx = (modeIdx + 1) % modes.size },
+                        onClick = {
+                            modeIdx = (modeIdx + 1) % modes.size
+                            interaction++
+                        },
                         colors = white
                     ) { Text("Aspecto: ${modes[modeIdx].second}") }
                 }
@@ -196,21 +210,33 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
                         .background(Color.Black.copy(alpha = 0.6f))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { interaction++ }) }
                         .displayCutoutPadding()
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
+                    val max = maxOf(duration, 1L).toFloat()
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(fmt(position), color = Color.White)
+                        Text(fmtTime(if (dragging) dragValue.toLong() else position), color = Color.White)
                         Slider(
-                            value = position.toFloat().coerceAtMost(maxOf(duration, 1L).toFloat()),
+                            value = (if (dragging) dragValue else position.toFloat()).coerceIn(0f, max),
                             onValueChange = {
-                                position = it.toLong()
+                                if (!dragging) exo.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                                dragging = true
+                                dragValue = it
+                                interaction++
                                 exo.seekTo(it.toLong())
                             },
-                            valueRange = 0f..maxOf(duration, 1L).toFloat(),
+                            onValueChangeFinished = {
+                                exo.setSeekParameters(SeekParameters.EXACT)
+                                exo.seekTo(dragValue.toLong())
+                                position = dragValue.toLong()
+                                dragging = false
+                                interaction++
+                            },
+                            valueRange = 0f..max,
                             modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
                         )
-                        Text(fmt(duration), color = Color.White)
+                        Text(fmtTime(duration), color = Color.White)
                     }
                     Row(
                         Modifier.fillMaxWidth(),
@@ -223,21 +249,26 @@ fun PlayerScreen(items: List<VideoItem>, onExit: () -> Unit) {
                                     exo.seekToPreviousMediaItem()
                                     exo.playWhenReady = true
                                 }
+                                interaction++
                             },
                             colors = white
                         ) { Text("◀ Anterior") }
-                        Spacer(Modifier.width(24.dp))
+                        TextButton(onClick = { seekBy(-10_000L) }, colors = white) { Text("−10 s") }
                         TextButton(
-                            onClick = { exo.playWhenReady = !exo.playWhenReady },
+                            onClick = {
+                                exo.playWhenReady = !exo.playWhenReady
+                                interaction++
+                            },
                             colors = white
                         ) { Text(if (paused) "Reproducir" else "Pausar") }
-                        Spacer(Modifier.width(24.dp))
+                        TextButton(onClick = { seekBy(10_000L) }, colors = white) { Text("+10 s") }
                         TextButton(
                             onClick = {
                                 if (exo.hasNextMediaItem()) {
                                     exo.seekToNextMediaItem()
                                     exo.playWhenReady = true
                                 }
+                                interaction++
                             },
                             colors = white
                         ) { Text("Siguiente ▶") }
